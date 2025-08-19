@@ -634,7 +634,7 @@ Quick Reference
 [denganliang.com](https://ref.denganliang.com)<!--rehype:target=_blank-->
 [ivanz.cc](https://ref.ivanz.cc)<!--rehype:target=_blank-->
 [dev6.site](https://ref.dev6.site/)<!--rehype:target=_blank-->
-[zishu.me](https://ref.zishu.me/)<!--rehype:target=_blank-->
+[zishu.me](https://ref.zishu.me/)<!--rehype:target=_blank&data-info=👆每天自动同步-->
 [sucan2233.cn](http://reference.sucan2233.cn)<!--rehype:target=_blank-->
 [bobh.cool](https://quickref.bobh.cool)<!--rehype:target=_blank-->
 [tangwudi.com](https://doc.tangwudi.com)<!--rehype:target=_blank-->
