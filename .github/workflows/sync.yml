@@ -1,0 +1,179 @@
+name: 同步Fork与上游仓库
+
+on:
+  schedule:
+    - cron: "0 0 * * *"    # 每天凌晨零点执行
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: '强制同步（忽略删除保护）'
+        required: false
+        default: 'false'
+        type: boolean
+      delete_files_threshold:
+        description: '删除文件数量阈值 (%)'
+        required: false
+        default: '30'
+      delete_size_threshold:
+        description: '删除文件大小阈值 (%)'
+        required: false
+        default: '20'
+      readme_diff_threshold:
+        description: 'README.md 差异比例阈值 (%)'
+        required: false
+        default: '50'
+
+env:
+  DELETE_FILES_THRESHOLD: ${{ github.event.inputs.delete_files_threshold || '30' }}
+  DELETE_SIZE_THRESHOLD: ${{ github.event.inputs.delete_size_threshold || '20' }}
+  README_DIFF_THRESHOLD: ${{ github.event.inputs.readme_diff_threshold || '50' }}
+  MAJOR_DELETION_COUNT: 50
+  UPSTREAM_REPO: "jaywcjlove/reference"  # 已更新为你的上游仓库
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出Fork仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置Git用户信息
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: 添加上游仓库
+        run: |
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          else
+            git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          fi
+          git fetch upstream
+
+      - name: 自动检测默认分支
+        id: detect_branches
+        run: |
+          UPSTREAM_DEFAULT_BRANCH=$(git remote show upstream | grep "HEAD branch" | sed 's/.*: //' | tr -d '[:space:]')
+          LOCAL_CURRENT_BRANCH=$(git branch --show-current | tr -d '[:space:]')
+          if [[ -z "$UPSTREAM_DEFAULT_BRANCH" || -z "$LOCAL_CURRENT_BRANCH" ]]; then
+            echo "❌ 无法检测分支" && exit 1
+          fi
+          echo "upstream_branch=$UPSTREAM_DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          echo "local_branch=$LOCAL_CURRENT_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: 检查是否需要同步
+        id: check_sync_needed
+        run: |
+          UPSTREAM_BRANCH="${{ steps.detect_branches.outputs.upstream_branch }}"
+          LOCAL_BRANCH="${{ steps.detect_branches.outputs.local_branch }}"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          git fetch origin "$LOCAL_BRANCH"
+          if git diff --quiet "origin/$LOCAL_BRANCH" "upstream/$UPSTREAM_BRANCH"; then
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          else
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 初始化保护日志
+        id: init_protection_log
+        if: steps.check_sync_needed.outputs.needs_sync == 'true'
+        run: |
+          mkdir -p /tmp/sync_logs
+          LOG_FILE="/tmp/sync_logs/protection.log"
+          echo "===== 🛡️ 同步保护日志 =====" > "$LOG_FILE"
+          echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
+
+      - name: 备份受保护文件
+        id: backup_files
+        if: steps.check_sync_needed.outputs.needs_sync == 'true'
+        run: |
+          BACKUP_DIR="/tmp/protected_backup"
+          mkdir -p "$BACKUP_DIR"
+          declare -a PROTECTED_PATHS=( ".github/workflows" "README.md" ".github" "Dockerfile" "docker-compose.yml" "docker-compose.yaml" "Makefile" "build.gradle" "build.gradle.kts" "pom.xml" "package.json" "requirements.txt" "setup.py" "pyproject.toml" "Cargo.toml" "go.mod" "CMakeLists.txt" "*.pro" "*.vcxproj" "*.sln" ".travis.yml" ".gitlab-ci.yml" "appveyor.yml" "azure-pipelines.yml" "bitbucket-pipelines.yml" )
+          BACKUP_COUNT=0
+          for PATTERN in "${PROTECTED_PATHS[@]}"; do
+            for FILE in $(find . -maxdepth 2 -name "$PATTERN" 2>/dev/null); do
+              if [[ -e "$FILE" ]]; then
+                mkdir -p "$BACKUP_DIR/$(dirname "$FILE")"
+                cp -r "$FILE" "$BACKUP_DIR/$FILE"
+                BACKUP_COUNT=$((BACKUP_COUNT+1))
+              fi
+            done
+          done
+          echo "backup_count=$BACKUP_COUNT" >> $GITHUB_OUTPUT
+
+      - name: 分析上游变更并进行安全检查
+        id: analyze_changes
+        if: steps.check_sync_needed.outputs.needs_sync == 'true'
+        run: |
+          UPSTREAM_BRANCH="${{ steps.detect_branches.outputs.upstream_branch }}"
+          LOCAL_BRANCH="${{ steps.detect_branches.outputs.local_branch }}"
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          LOCAL_FILES_TMP=$(mktemp)
+          UPSTREAM_FILES_TMP=$(mktemp)
+          DELETED_FILES_TMP=$(mktemp)
+          git ls-tree -r --name-only "origin/$LOCAL_BRANCH" | sort > "$LOCAL_FILES_TMP"
+          git ls-tree -r --name-only "upstream/$UPSTREAM_BRANCH" | sort > "$UPSTREAM_FILES_TMP"
+          comm -23 "$LOCAL_FILES_TMP" "$UPSTREAM_FILES_TMP" > "$DELETED_FILES_TMP"
+          DELETED_COUNT=$(wc -l < "$DELETED_FILES_TMP")
+          LOCAL_COUNT=$(wc -l < "$LOCAL_FILES_TMP")
+          DELETE_RATIO=0
+          if (( LOCAL_COUNT > 0 )); then
+            DELETE_RATIO=$((DELETED_COUNT * 100 / LOCAL_COUNT))
+          fi
+          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+          echo "delete_ratio=$DELETE_RATIO" >> $GITHUB_OUTPUT
+          echo "safe_to_sync=true" >> $GITHUB_OUTPUT
+          if [[ "${{ github.event.inputs.force_sync }}" != "true" ]]; then
+            if (( DELETE_RATIO > ${{ env.DELETE_FILES_THRESHOLD }} )); then
+              echo "safe_to_sync=false" >> $GITHUB_OUTPUT
+              echo "block_reason=删除文件过多" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+      - name: 执行同步操作
+        if: steps.analyze_changes.outputs.safe_to_sync == 'true'
+        run: |
+          git checkout "${{ steps.detect_branches.outputs.local_branch }}"
+          if ! git merge --no-edit "upstream/${{ steps.detect_branches.outputs.upstream_branch }}"; then
+            echo "❌ 合并冲突，请手动处理"
+            exit 1
+          fi
+
+      - name: 恢复受保护文件并检查README差异
+        if: steps.analyze_changes.outputs.safe_to_sync == 'true' && steps.backup_files.outputs.backup_count != '0'
+        run: |
+          BACKUP_DIR="/tmp/protected_backup"
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          RESTORED_FILES_LOG=""
+          if [[ -f "$BACKUP_DIR/README.md" && -f "README.md" ]]; then
+            DIFF_OUTPUT=$(mktemp)
+            diff -u "$BACKUP_DIR/README.md" "README.md" > "$DIFF_OUTPUT" || true
+            DIFF_LINES=$(grep -E '^[+-]' "$DIFF_OUTPUT" | grep -vE '^\+\+\+|^\-\-\-' | wc -l)
+            TOTAL_LINES=$(wc -l < "$BACKUP_DIR/README.md")
+            CHANGE_PERCENT=$(( DIFF_LINES * 100 / (TOTAL_LINES>0?TOTAL_LINES:1) ))
+            if (( CHANGE_PERCENT > ${{ env.README_DIFF_THRESHOLD }} )); then
+              cp "$BACKUP_DIR/README.md" "README.md"
+              git add "README.md"
+              RESTORED_FILES_LOG="$RESTORED_FILES_LOG\n  - README.md (保护本地版本)"
+            fi
+          fi
+          if ! git diff --cached --quiet; then
+            git commit -m "🛡️ 自动恢复受保护文件$RESTORED_FILES_LOG"
+          fi
+
+      - name: 推送更新到Fork仓库
+        if: steps.analyze_changes.outputs.safe_to_sync == 'true'
+        run: |
+          git push origin "${{ steps.detect_branches.outputs.local_branch }}"
+
+      - name: 同步被阻止（安全保护触发）
+        if: steps.analyze_changes.outputs.safe_to_sync == 'false'
+        run: |
+          echo "🚫 同步被阻止: ${{ steps.analyze_changes.outputs.block_reason }}"
+          exit 1
